@@ -1,0 +1,218 @@
+--- setup.py ---
+from setuptools import setup, find_packages
+from pybind11.setup_helpers import Pybind11Extension, build_ext
+
+ext_modules = [
+    Pybind11Extension(
+        "inference_engine.kernels.cuda_module",
+        [
+            "inference_engine/kernels/cuda_module.cpp",
+            "inference_engine/kernels/cuda_kernel.cu"
+        ],
+        include_dirs=[],
+        extra_compile_args={
+            'nvcc': ['-O3', '--compiler-options', "'-fPIC'"],
+            'cxx': ['-O3']
+        }
+    )
+]
+
+setup(
+    name='visioscan_mvp',
+    version='0.1.0',
+    packages=find_packages(),
+    install_requires=[
+        'torch==2.2.0', 'numpy', 'pydantic', 'fastapi', 'uvicorn', 'pillow', 'pydicom', 'scikit-image'
+    ],
+    ext_modules=ext_modules,
+    cmdclass={'build_ext': build_ext},
+)
+
+--- inference_engine/models/cnn_ensemble.py ---
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+
+class CNNEnsemble:
+    def __init__(self, model_paths, device=None):
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.models = []
+        for p in model_paths:
+            m = torch.load(p, map_location=self.device)
+            m.eval().to(self.device)
+            self.models.append(m)
+        self.transform = transforms.Compose([
+            transforms.Resize((224,224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+
+    def predict(self, image: Image.Image):
+        x = self.transform(image).unsqueeze(0).to(self.device)
+        outputs = [torch.sigmoid(m(x)) for m in self.models]
+        return torch.mean(torch.stack(outputs), dim=0).cpu().detach().numpy()
+
+--- inference_engine/models/unet3d.py ---
+import torch
+import torch.nn as nn
+
+# Basic 3D U-Net skeleton
+class DoubleConv(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(in_c, out_c, 3, padding=1),
+            nn.BatchNorm3d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_c, out_c, 3, padding=1),
+            nn.BatchNorm3d(out_c),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x): return self.net(x)
+
+class UNet3D(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, features=[32,64,128]):
+        super().__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        # Down
+        for f in features:
+            self.downs.append(DoubleConv(in_ch, f))
+            in_ch = f
+            self.downs.append(nn.MaxPool3d(2))
+        # Up
+        for f in reversed(features):
+            self.ups.append(nn.ConvTranspose3d(in_ch, f, 2, stride=2))
+            self.ups.append(DoubleConv(in_ch, f))
+            in_ch = f
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
+        self.final = nn.Conv3d(features[0], out_ch, 1)
+
+    def forward(self, x):
+        skip_connections = []
+        for i in range(0, len(self.downs), 2):
+            x = self.downs[i](x)
+            skip_connections.append(x)
+            x = self.downs[i+1](x)
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip = skip_connections[idx//2]
+            x = torch.cat((skip, x), dim=1)
+            x = self.ups[idx+1](x)
+        return torch.sigmoid(self.final(x))
+
+--- inference_engine/models/utils.py ---
+import os
+import zipfile
+import numpy as np
+import pydicom
+
+def load_dicom_series(zip_path):
+    """Extracts and loads a DICOM series from a zip file into a NumPy 3D array."""
+    temp_dir = zip_path + '_tmp'
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(temp_dir)
+    files = [os.path.join(temp_dir, f) for f in sorted(os.listdir(temp_dir)) if f.endswith('.dcm')]
+    slices = [pydicom.dcmread(f).pixel_array for f in files]
+    volume = np.stack(slices, axis=0)[None, ...]  # shape: [1, D, H, W]
+    return volume.astype(np.float32)
+
+--- inference_engine/kernels/CMakeLists.txt ---
+cmake_minimum_required(VERSION 3.18)
+project(cuda_module LANGUAGES CXX CUDA)
+
+find_package(pybind11 REQUIRED)
+pybind11_add_module(cuda_module cuda_module.cpp cuda_kernel.cu)
+set_target_properties(cuda_module PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+--- inference_engine/kernels/cuda_kernel.cu ---
+extern "C" __global__ void scale_kernel(float* data, int N, float factor) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) data[idx] *= factor;
+}
+
+--- inference_engine/kernels/cuda_module.cpp ---
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <cuda_runtime.h>
+
+namespace py = pybind11;
+
+void run_scale(py::array_t<float> array, float factor) {
+    auto buf = array.request();
+    float* ptr = static_cast<float*>(buf.ptr);
+    int N = buf.size;
+    float* d_ptr;
+    cudaMalloc(&d_ptr, N * sizeof(float));
+    cudaMemcpy(d_ptr, ptr, N * sizeof(float), cudaMemcpyHostToDevice);
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    scale_kernel<<<blocks, threads>>>(d_ptr, N, factor);
+    cudaMemcpy(ptr, d_ptr, N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_ptr);
+}
+
+PYBIND11_MODULE(cuda_module, m) {
+    m.def("scale", &run_scale, "Scale array in-place by factor via CUDA");
+}
+
+--- inference_engine/services/api.py ---
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from io import BytesIO
+from PIL import Image
+import numpy as np
+import zipfile
+import tempfile
+
+from inference_engine.models.cnn_ensemble import CNNEnsemble
+from inference_engine.models.unet3d import UNet3D
+from inference_engine.models.utils import load_dicom_series
+import torch
+import os
+import inference_engine.kernels.cuda_module as cuda_mod
+
+app = FastAPI(title="VISIOSCAN AI Inference")
+
+# Initialize models (paths to pretrained weights)
+CXR_MODEL_PATHS = ["models/cxr_model1.pt", "models/cxr_model2.pt"]
+HEAD_CT_MODEL_PATH = "models/unet3d_headct.pt"
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+cnn_ensemble = CNNEnsemble(CXR_MODEL_PATHS, device)
+unet3d = UNet3D().to(device)
+unet3d.load_state_dict(torch.load(HEAD_CT_MODEL_PATH, map_location=device))
+unet3d.eval()
+
+@app.post("/infer/cxr")
+async def infer_cxr(file: UploadFile = File(...)):
+    try:
+        img = Image.open(BytesIO(await file.read())).convert('RGB')
+        scores = cnn_ensemble.predict(img)
+        return {"scores": scores.tolist()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/infer/head_ct")
+async def infer_head_ct(zip_file: UploadFile = File(...)):
+    try:
+        # Save uploaded zip
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        tmp.write(await zip_file.read()); tmp.close()
+        vol = load_dicom_series(tmp.name)
+        # CUDA-accelerated preproc example
+        cuda_mod.scale(vol, 1.0/4095.0)
+        x = torch.from_numpy(vol).unsqueeze(0).to(device)  # [1,1,D,H,W]
+        with torch.no_grad():
+            mask = unet3d(x).cpu().numpy()[0,0]
+        return {"mask_shape": mask.shape, "mask": mask.tolist()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+--- inference_engine/inference.py ---
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run("inference_engine.services.api:app", host="0.0.0.0", port=8000, reload=True)
